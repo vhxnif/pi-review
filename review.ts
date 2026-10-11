@@ -160,6 +160,10 @@ const PULL_REQUEST_PROMPT_FALLBACK =
 const FOLDER_REVIEW_PROMPT =
 	"Review the code in the following paths: {paths}. This is a snapshot review (not a diff). Read the files directly in these paths and provide prioritized, actionable findings.";
 
+// All review output must be written in Chinese.
+const REVIEW_OUTPUT_LANGUAGE =
+	"Write the entire review in Chinese (简体中文), including findings, verdict, and callouts. Keep code snippets, file paths, and identifiers unchanged.";
+
 // The detailed review rubric (adapted from Codex's review_prompt.md)
 const REVIEW_RUBRIC = `# Review Guidelines
 
@@ -1164,6 +1168,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		if (projectGuidelines) {
 			fullPrompt += `\n\nThis project has additional instructions for code reviews:\n\n${projectGuidelines}`;
 		}
+
+		// Keep last so it overrides any other language guidance
+		fullPrompt += `\n\n${REVIEW_OUTPUT_LANGUAGE}`;
 
 		const modeHint = useFreshSession ? " (fresh session)" : "";
 		ctx.ui.notify(`Starting review: ${hint}${modeHint}`, "info");

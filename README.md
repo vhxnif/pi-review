@@ -6,7 +6,7 @@ that is used by us at Earendil.
 ## Install
 
 ```bash
-pi install git:github.com/earendil-works/pi-review
+pi install git:github.com/vhxnif/pi-review
 ```
 
 ## What It Does
