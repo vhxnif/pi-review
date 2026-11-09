@@ -43,6 +43,29 @@ When a review session is active, finish it with:
 
 You can then return only, return + summarize, or return + queue fixing work.
 
+## Review model
+
+Fresh-branch reviews (review only **and** auto mode) let you pick which model performs
+the review:
+
+```
+Model for the review branch:
+  Use current model (anthropic/claude-sonnet-4)
+  openai/gpt-5
+  ...
+```
+
+Choose `Use current model` to keep the session model. When the review branch runs on a
+different model, the review uses it and the main-branch model is restored on
+`/end-review`, or when you navigate back to the main branch with `/tree` (auto mode
+restores it on every return to the main branch). Re-entering the review branch with
+`/tree` reapplies its review model.
+
+Selecting a review model temporarily changes Pi's global default model. The main model
+is restored on the exit paths above and on shutdown (with a warning if it is no longer
+available), so the next session starts on the main model. A reload keeps the review
+model while the review branch is still active.
+
 ## Auto review loop
 
 When starting a review in a fresh branch, `/review` also offers an automatic mode:
