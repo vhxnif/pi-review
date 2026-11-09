@@ -30,7 +30,12 @@
  * Note: PR review requires a clean working tree (no uncommitted changes to tracked files).
  */
 
-import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	ExtensionCommandContext,
+	SessionTreeEvent,
+} from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, BorderedLoader } from "@earendil-works/pi-coding-agent";
 import {
 	Container,
@@ -42,13 +47,17 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 
 // State to track fresh session review (where we branched from).
 // Module-level state means only one review can be active at a time.
 // This is intentional - the UI and /end-review command assume a single active review.
 let reviewOriginId: string | undefined = undefined;
+// Identifies the review branch itself. Reviews can share the same `reviewOriginId`
+// (same return target, and nested reviews inherit ancestor state entries), so only
+// the branch id written when the review started tells branches apart.
+let reviewBranchId: string | undefined = undefined;
 let endReviewInProgress = false;
 let reviewCustomInstructions: string | undefined = undefined;
 
@@ -65,6 +74,17 @@ const PR_CHECKOUT_BLOCKED_BY_PENDING_CHANGES_MESSAGE =
 type ReviewSessionState = {
 	active: boolean;
 	originId?: string;
+	// Unique id generated when the review branch is created. `originId` is the
+	// return target on the main branch, so nested reviews can share it; this id
+	// identifies the review branch itself.
+	branchId?: string;
+	// Model/thinking level that were active before a review branch took over.
+	// /end-review restores them so the main branch keeps its own settings.
+	mainModel?: ModelRef;
+	mainThinkingLevel?: ReviewThinkingLevel;
+	// Review-only model selected for this branch. `/tree` does not replay the
+	// branch's model_change entries, so re-entering the branch reapplies it.
+	reviewModel?: ModelRef;
 };
 
 type ReviewSettingsState = {
@@ -376,9 +396,38 @@ function setReviewWidget(ctx: ExtensionContext, active: boolean) {
 	});
 }
 
-function getReviewState(ctx: ExtensionContext): ReviewSessionState | undefined {
+type ReviewBranchState = {
+	/** Stable identity of the branch. Falls back to the entry id for legacy states. */
+	identity?: string;
+	/** Latest review-session entry on the branch. Carries the state that applies here. */
+	latestState?: ReviewSessionState;
+};
+
+function getReviewBranchState(ctx: ExtensionContext, fromId?: string): ReviewBranchState {
+	let latestState: ReviewSessionState | undefined;
+	let latestEntryId: string | undefined;
+	const branch = fromId === undefined ? ctx.sessionManager.getBranch() : ctx.sessionManager.getBranch(fromId);
+	for (const entry of branch) {
+		if (entry.type !== "custom" || entry.customType !== REVIEW_STATE_TYPE) continue;
+		latestEntryId = entry.id;
+		latestState = entry.data as ReviewSessionState;
+	}
+
+	return { identity: latestState?.branchId ?? latestEntryId, latestState };
+}
+
+function getReviewState(ctx: ExtensionContext, fromId?: string): ReviewSessionState | undefined {
+	return getReviewBranchState(ctx, fromId).latestState;
+}
+
+/**
+ * Latest review state across the whole session, not just the current branch.
+ * Review-session entries are appended on the review branch, so they disappear
+ * from `getBranch()` as soon as that branch is left.
+ */
+function getLatestReviewSession(ctx: ExtensionContext): ReviewSessionState | undefined {
 	let state: ReviewSessionState | undefined;
-	for (const entry of ctx.sessionManager.getBranch()) {
+	for (const entry of ctx.sessionManager.getEntries()) {
 		if (entry.type === "custom" && entry.customType === REVIEW_STATE_TYPE) {
 			state = entry.data as ReviewSessionState | undefined;
 		}
@@ -388,15 +437,18 @@ function getReviewState(ctx: ExtensionContext): ReviewSessionState | undefined {
 }
 
 function applyReviewState(ctx: ExtensionContext) {
-	const state = getReviewState(ctx);
+	const branch = getReviewBranchState(ctx);
+	const state = branch.latestState;
 
 	if (state?.active && state.originId) {
 		reviewOriginId = state.originId;
+		reviewBranchId = branch.identity;
 		setReviewWidget(ctx, true);
 		return;
 	}
 
 	reviewOriginId = undefined;
+	reviewBranchId = undefined;
 	setReviewWidget(ctx, false);
 }
 
@@ -870,9 +922,68 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		persistReviewSettings();
 	}
 
-	function applyAllReviewState(ctx: ExtensionContext) {
+	function persistReviewState(state: ReviewSessionState) {
+		pi.appendEntry(REVIEW_STATE_TYPE, { ...state, branchId: state.branchId ?? randomUUID() });
+	}
+
+	// Navigations this extension starts (into/out of the review branch) restore the
+	// main settings on their explicit path; the session_tree hook must not
+	// duplicate that work while they run.
+	let reviewNavigationDepth = 0;
+
+	async function withReviewNavigation<T>(fn: () => Promise<T>): Promise<T> {
+		reviewNavigationDepth += 1;
+		try {
+			return await fn();
+		} finally {
+			reviewNavigationDepth -= 1;
+		}
+	}
+
+	async function applyAllReviewState(ctx: ExtensionContext, event?: SessionTreeEvent): Promise<void> {
 		applyReviewSettings(ctx);
+		const previousOriginId = reviewOriginId;
+		// The branch we came from, before `applyReviewState` switches to the new one.
+		// Reading it from `oldLeafId` avoids stale in-memory identity after appends.
+		const previousBranch =
+			event?.oldLeafId === null || event?.oldLeafId === undefined
+				? undefined
+				: getReviewBranchState(ctx, event.oldLeafId);
 		applyReviewState(ctx);
+
+		// Extension-started navigations (review entry/exit, auto loop) apply or
+		// restore the settings on their explicit path.
+		if (reviewNavigationDepth > 0) return;
+
+		if (reviewOriginId !== undefined) {
+			// A manual /tree entered a review branch (or jumped between two review
+			// branches that may share the same origin). Compare the branch ids written
+			// when each review started, not `originId`, which only names the return
+			// target (nested reviews can even inherit ancestor state entries).
+			if (previousBranch?.identity !== reviewBranchId) {
+				const state = getReviewState(ctx);
+				if (state?.active) {
+					await restoreReviewMainSettings(ctx, state);
+					await applyReviewModel(ctx, state);
+				}
+			}
+			return;
+		}
+
+		if (previousOriginId === undefined) return;
+
+		// A manual navigation (e.g. /tree) left the review branch without going through
+		// /end-review. Read the state from the branch that was just left instead of the
+		// session-wide latest entry: other review branches may have their own, newer
+		// snapshot.
+		const state =
+			event?.oldLeafId === null || event?.oldLeafId === undefined
+				? getLatestReviewSession(ctx)
+				: previousBranch?.latestState;
+		if (!state?.active) return;
+		// Await the restore: `navigateTree` awaits session_tree handlers, so the next
+		// turn (or a new review) cannot start on the review model.
+		await restoreReviewMainSettings(ctx, state);
 	}
 
 	async function ensureGithubCliReady(ctx: ExtensionContext): Promise<boolean> {
@@ -949,8 +1060,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		};
 	}
 
-	pi.on("session_start", (_event, ctx) => {
-		applyAllReviewState(ctx);
+	pi.on("session_start", async (_event, ctx) => {
+		await applyAllReviewState(ctx);
 		const latest = readLatestAutoState(ctx);
 		if (latest && latest.phase !== "done" && latest.phase !== "stopped" && latest.phase !== "error") {
 			ctx.ui.notify(
@@ -982,8 +1093,23 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	});
 
 
-	pi.on("session_tree", (_event, ctx) => {
-		applyAllReviewState(ctx);
+	pi.on("session_tree", async (event, ctx) => {
+		await applyAllReviewState(ctx, event);
+	});
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		// pi.setModel persists the model as the global default. Quitting straight from
+		// a review branch would leave the review model as the default for the next
+		// session, so restore the main settings on the way out. A reload keeps this
+		// session (and its review branch) alive, so leave it untouched.
+		if (event.reason === "reload" || reviewNavigationDepth > 0) return;
+		const state = getReviewState(ctx);
+		if (!state?.active) return;
+		try {
+			await restoreReviewMainSettings(ctx, state);
+		} catch {
+			// Shutdown must not fail because the settings could not be restored.
+		}
 	});
 
 	/**
@@ -1429,7 +1555,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			// Navigate to first user message to create a new branch from that point
 			// Label it as "code-review" so it's visible in the tree
 			try {
-				const result = await ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" });
+				const result = await withReviewNavigation(() =>
+					ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" }),
+				);
 				if (result.cancelled) {
 					reviewOriginId = undefined;
 					return null;
@@ -1451,8 +1579,6 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		// Show widget indicating review is active
 		setReviewWidget(ctx, true);
 
-		// Persist review state so tree navigation can restore/reset it
-		pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
 		return lockedOriginId;
 	}
 
@@ -1494,7 +1620,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		ctx: ExtensionCommandContext,
 		target: ReviewTarget,
 		useFreshSession: boolean,
-		options?: { extraInstruction?: string },
+		options?: { extraInstruction?: string; reviewModel?: ReviewModel },
 	): Promise<boolean> {
 		// Check if we're already in a review
 		if (reviewOriginId) {
@@ -1502,9 +1628,39 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			return false;
 		}
 
+		// Captured before the switch so /end-review can restore the main settings.
+		const mainModel = modelRef(ctx.model);
+		const mainThinkingLevel = pi.getThinkingLevel();
+
+		let reviewOriginIdForState: string | undefined;
 		if (useFreshSession) {
-			const originId = await enterFreshReviewBranch(ctx);
-			if (!originId) return false;
+			reviewOriginIdForState = (await enterFreshReviewBranch(ctx)) ?? undefined;
+			if (!reviewOriginIdForState) return false;
+		}
+
+		let appliedReviewModel: ModelRef | undefined;
+		if (options?.reviewModel) {
+			if (await applyModel(options.reviewModel)) {
+				appliedReviewModel = modelRef(options.reviewModel);
+			} else {
+				ctx.ui.notify(
+					`No authentication for ${options.reviewModel.provider}/${options.reviewModel.id}; using the current model for the review branch.`,
+					"warning",
+				);
+			}
+		}
+
+		if (reviewOriginIdForState) {
+			// Persist one state entry per review branch: its id is the branch identity, and
+			// it carries the review model so `/tree` re-entry can reapply it (tree
+			// navigation does not replay model_change entries).
+			persistReviewState({
+				active: true,
+				originId: reviewOriginIdForState,
+				mainModel,
+				mainThinkingLevel,
+				reviewModel: appliedReviewModel,
+			});
 		}
 
 		const fullPrompt = await buildFullReviewPrompt(ctx, target, options?.extraInstruction);
@@ -1620,6 +1776,84 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 		}
 	}
 
+	/**
+	 * Restore the main-branch model and thinking level that a review branch
+	 * replaced. Shared by /end-review, manual tree navigation, and the auto loop so
+	 * every exit path keeps the same ordering (model first, then thinking level)
+	 * and the same failure semantics.
+	 */
+	async function restoreMainSettings(
+		ctx: ExtensionContext,
+		mainModel: ModelRef | undefined,
+		mainThinkingLevel: ReviewThinkingLevel | undefined,
+	): Promise<StoredModelApply> {
+		let result: StoredModelApply = "none";
+		if (mainModel) {
+			const current = ctx.model;
+			const unchanged =
+				current !== undefined && current.provider === mainModel.provider && current.id === mainModel.id;
+			result = unchanged ? "ok" : await applyStoredModel(ctx, mainModel);
+		}
+
+		// A failed model switch leaves the review model active; its thinking-level
+		// clamp would only be changed again, so surface the model failure instead.
+		if (result === "missing" || result === "failed") return result;
+
+		if (mainThinkingLevel && pi.getThinkingLevel() !== mainThinkingLevel) {
+			applyThinking(mainThinkingLevel);
+		}
+		return result;
+	}
+
+	/**
+	 * Restore the main-branch settings recorded on a review-session state entry and
+	 * report failures to the user. Used by /end-review and when a manual tree
+	 * navigation leaves the review branch.
+	 */
+	async function restoreReviewMainSettings(
+		ctx: ExtensionContext,
+		state: ReviewSessionState | undefined,
+	): Promise<void> {
+		if (!state) return;
+
+		const result = await restoreMainSettings(ctx, state.mainModel, state.mainThinkingLevel);
+		if (result !== "missing" && result !== "failed") return;
+
+		const label = state.mainModel
+			? `${state.mainModel.provider}/${state.mainModel.id}`
+			: "the main branch model";
+		ctx.ui.notify(
+			result === "missing"
+				? `Could not restore ${label}: the model is no longer available. The review model is still active.`
+				: `Could not restore ${label}; the review model is still active.`,
+			"warning",
+		);
+	}
+
+	/**
+	 * Reapply the review-only model when a manual navigation enters a review branch.
+	 * A branch without a saved review model ("use current model") is left untouched.
+	 */
+	async function applyReviewModel(
+		ctx: ExtensionContext,
+		state: ReviewSessionState | undefined,
+	): Promise<void> {
+		if (!state?.active) return;
+
+		const result = await applyStoredModel(ctx, state.reviewModel);
+		if (result !== "missing" && result !== "failed") return;
+
+		const label = state.reviewModel
+			? `${state.reviewModel.provider}/${state.reviewModel.id}`
+			: "the review model";
+		ctx.ui.notify(
+			result === "missing"
+				? `Could not switch to ${label}: the model is no longer available. The current model is still in use.`
+				: `Could not switch to ${label}; the current model is still in use.`,
+			"warning",
+		);
+	}
+
 	function applyThinking(level: ReviewThinkingLevel | undefined): void {
 		if (!level) return;
 		// `pi.setThinkingLevel` clamps to what the current model supports and does
@@ -1684,14 +1918,16 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 			if (!ctx.model) {
 				throw new Error("cannot summarize the review branch: no model is available for the summary");
 			}
-			const result = await ctx.navigateTree(targetId, {
-				summarize: true,
-				customInstructions: summaryPrompt,
-				replaceInstructions: true,
-			});
+			const result = await withReviewNavigation(() =>
+				ctx.navigateTree(targetId, {
+					summarize: true,
+					customInstructions: summaryPrompt,
+					replaceInstructions: true,
+				}),
+			);
 			return !result.cancelled;
 		}
-		const result = await ctx.navigateTree(targetId, { summarize: false });
+		const result = await withReviewNavigation(() => ctx.navigateTree(targetId, { summarize: false }));
 		return !result.cancelled;
 	}
 
@@ -1730,7 +1966,7 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 		};
 	}
 
-	async function showAutoReviewModelSelector(
+	async function showReviewModelSelector(
 		ctx: ExtensionCommandContext,
 	): Promise<{ model?: ReviewModel } | null> {
 		const current = ctx.model;
@@ -1798,7 +2034,7 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 				}
 			}
 
-			const modelResult = await applyStoredModel(ctx, snapshot.mainModel);
+			const modelResult = await restoreMainSettings(ctx, snapshot.mainModel, snapshot.mainThinkingLevel);
 			if (modelResult === "missing" || modelResult === "failed") {
 				const label = snapshot.mainModel
 					? `${snapshot.mainModel.provider}/${snapshot.mainModel.id}`
@@ -1820,7 +2056,6 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 				clearReviewState(ctx);
 				return;
 			}
-			applyThinking(snapshot.mainThinkingLevel);
 
 			const mainLeafId = ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId;
 			persistAutoState({ ...snapshot, branch: "main", phase, reason, mainLeafId });
@@ -1901,6 +2136,16 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 				);
 				reviewModel = undefined;
 			}
+
+			// Record the review model on the branch so manual /tree re-entry can reapply it.
+			// This is the single state entry that defines the review branch.
+			persistReviewState({
+				active: true,
+				originId,
+				mainModel: modelRef(mainModel),
+				mainThinkingLevel,
+				reviewModel: modelRef(reviewModel),
+			});
 
 			snapshot = {
 				v: 1,
@@ -2020,13 +2265,16 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 					await finishAutoReview(ctx, snapshot, "stopped", "navigation to main branch cancelled");
 					return;
 				}
-				const mainModelResult = await applyStoredModel(ctx, snapshot.mainModel);
+				const mainModelResult = await restoreMainSettings(
+					ctx,
+					snapshot.mainModel,
+					snapshot.mainThinkingLevel,
+				);
 				if (mainModelResult === "missing" || mainModelResult === "failed") {
 					// finishAutoReview retries the restore and surfaces the failure to the user.
 					await finishAutoReview(ctx, { ...snapshot, branch: "main" }, "error", "failed to restore main branch model");
 					return;
 				}
-				applyThinking(snapshot.mainThinkingLevel);
 
 				let mainLeafId: string = ctx.sessionManager.getLeafId() ?? snapshot.mainLeafId;
 				snapshot = { ...snapshot, branch: "main", phase: "fix", mainLeafId, reviewLeafId };
@@ -2414,9 +2662,9 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 				}
 
 				let autoOptions: AutoReviewOptions | undefined;
+				let reviewModel: ReviewModel | undefined;
 
 				if (parsed.auto) {
-					let reviewModel: ReviewModel | undefined;
 					if (parsed.auto.reviewModel) {
 						reviewModel = findModelByRef(ctx, parsed.auto.reviewModel);
 						if (!reviewModel) {
@@ -2446,7 +2694,7 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 					}
 
 					if (after.startsWith("Auto")) {
-						const modelChoice = await showAutoReviewModelSelector(ctx);
+						const modelChoice = await showReviewModelSelector(ctx);
 						if (modelChoice === null) {
 							ctx.ui.notify("Review cancelled", "info");
 							return;
@@ -2464,6 +2712,13 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 							summary: false,
 							extraInstruction,
 						};
+					} else {
+						const modelChoice = await showReviewModelSelector(ctx);
+						if (modelChoice === null) {
+							ctx.ui.notify("Review cancelled", "info");
+							return;
+						}
+						reviewModel = modelChoice.model;
 					}
 				}
 
@@ -2472,7 +2727,7 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 					return;
 				}
 
-				await executeReview(ctx, target, useFreshSession, { extraInstruction });
+				await executeReview(ctx, target, useFreshSession, { extraInstruction, reviewModel });
 				return;
 			}
 		},
@@ -2578,11 +2833,13 @@ Instructions:
 				const loader = new BorderedLoader(tui, theme, "Returning and summarizing review branch...");
 				loader.onAbort = () => done(null);
 
-				ctx.navigateTree(originId, {
-					summarize: true,
-					customInstructions: REVIEW_SUMMARY_PROMPT,
-					replaceInstructions: true,
-				})
+				withReviewNavigation(() =>
+					ctx.navigateTree(originId, {
+						summarize: true,
+						customInstructions: REVIEW_SUMMARY_PROMPT,
+						replaceInstructions: true,
+					}),
+				)
 					.then(done)
 					.catch((err) => done({ cancelled: false, error: err instanceof Error ? err.message : String(err) }));
 
@@ -2591,11 +2848,13 @@ Instructions:
 		}
 
 		try {
-			return await ctx.navigateTree(originId, {
-				summarize: true,
-				customInstructions: REVIEW_SUMMARY_PROMPT,
-				replaceInstructions: true,
-			});
+			return await withReviewNavigation(() =>
+				ctx.navigateTree(originId, {
+					summarize: true,
+					customInstructions: REVIEW_SUMMARY_PROMPT,
+					replaceInstructions: true,
+				}),
+			);
 		} catch (error) {
 			return { cancelled: false, error: error instanceof Error ? error.message : String(error) };
 		}
@@ -2606,6 +2865,9 @@ Instructions:
 		action: EndReviewAction,
 		options: EndReviewActionOptions = {},
 	): Promise<EndReviewActionResult> {
+		// Read the state before navigating: the review-session entry stays on the review
+		// branch, so the main-branch snapshot must be captured while still on it.
+		const reviewState = getReviewState(ctx);
 		const originId = getActiveReviewOrigin(ctx);
 		if (!originId) {
 			if (!getReviewState(ctx)?.active) {
@@ -2618,7 +2880,7 @@ Instructions:
 
 		if (action === "returnOnly") {
 			try {
-				const result = await ctx.navigateTree(originId, { summarize: false });
+				const result = await withReviewNavigation(() => ctx.navigateTree(originId, { summarize: false }));
 				if (result.cancelled) {
 					ctx.ui.notify("Navigation cancelled. Use /end-review to try again.", "info");
 					return "cancelled";
@@ -2629,6 +2891,7 @@ Instructions:
 			}
 
 			clearReviewState(ctx);
+			await restoreReviewMainSettings(ctx, reviewState);
 			if (notifySuccess) {
 				ctx.ui.notify("Review complete! Returned to original position.", "info");
 			}
@@ -2652,6 +2915,7 @@ Instructions:
 		}
 
 		clearReviewState(ctx);
+		await restoreReviewMainSettings(ctx, reviewState);
 
 		if (action === "returnAndSummarize") {
 			if (!ctx.ui.getEditorText().trim()) {
