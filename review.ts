@@ -6,7 +6,8 @@
  * - Review a GitHub pull request (checks out the PR locally)
  * - Review against a base branch (PR style)
  * - Review uncommitted changes
- * - Review a specific commit
+ * - Review one or more commits (multi-select in the selector)
+ * - Review every commit after a given commit
  * - Shared custom review instructions (applied to all review modes when configured)
  *
  * Usage:
@@ -16,6 +17,8 @@
  * - `/review uncommitted` - review uncommitted changes directly
  * - `/review branch main` - review against main branch
  * - `/review commit abc123` - review specific commit
+ * - `/review commits abc123 def456` - review several commits together
+ * - `/review after abc123` - review every commit after abc123 (exclusive)
  * - `/review folder src docs` - review specific folders/files (snapshot, not diff)
  * - `/review` selector includes Add/Remove custom review instructions (applies to all modes)
  * - `/review --extra "focus on performance regressions"` - add extra review instruction (works with any mode)
@@ -41,6 +44,8 @@ import {
 	Container,
 	fuzzyFilter,
 	Input,
+	Key,
+	matchesKey,
 	type SelectItem,
 	SelectList,
 	Spacer,
@@ -471,10 +476,21 @@ function applyReviewSettings(ctx: ExtensionContext) {
 }
 
 // Review target types (matching Codex's approach)
+type ReviewCommit = { sha: string; title?: string };
+
 type ReviewTarget =
 	| { type: "uncommitted" }
 	| { type: "baseBranch"; branch: string }
-	| { type: "commit"; sha: string; title?: string }
+	| {
+			type: "commits";
+			commits: ReviewCommit[]; // oldest commit last (git log order)
+			/**
+			 * Explicit exclusive base for a range review ("every commit after X").
+			 * Deriving the base from the oldest selected commit's parent is wrong for
+			 * non-linear history, where it can pull in commits outside the range.
+			 */
+			rangeBase?: string;
+		}
 	| { type: "pullRequest"; prNumber: number; baseBranch: string; title: string }
 	| { type: "folder"; paths: string[] };
 
@@ -492,6 +508,15 @@ const COMMIT_PROMPT_WITH_TITLE =
 	'Review the code changes introduced by commit {sha} ("{title}"). Provide prioritized, actionable findings.';
 
 const COMMIT_PROMPT = "Review the code changes introduced by commit {sha}. Provide prioritized, actionable findings.";
+
+const COMMITS_DIFF_PROMPT =
+	"Review the code changes introduced by the following {count} commits (oldest first):\n{commits}\n\nThese commits form a contiguous range, so `git diff {base}...{newest}` shows exactly their combined changes. Run that command to inspect the diff. Provide prioritized, actionable findings.";
+
+const COMMITS_RANGE_PROMPT =
+	"Review the code changes introduced by the following {count} commits, i.e. every commit after {base} up to {newest} (oldest first):\n{commits}\n\n`git diff {base}...{newest}` shows exactly their combined changes. Run that command to inspect the diff. Provide prioritized, actionable findings.";
+
+const COMMITS_PROMPT =
+	"Review the code changes introduced by the following {count} commits (oldest first):\n{commits}\n\nInspect each commit individually with `git diff <sha>^ <sha>` (for a merge commit this shows the changes merged in) and review the changes across all of them together. Provide prioritized, actionable findings.";
 
 const PULL_REQUEST_PROMPT =
 	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
@@ -698,20 +723,111 @@ async function getLocalBranches(pi: ExtensionAPI): Promise<string[]> {
 }
 
 /**
- * Get list of recent commits
+ * Parse `git log --format=%H %s` output into commits (newest first)
  */
-async function getRecentCommits(pi: ExtensionAPI, limit: number = 10): Promise<Array<{ sha: string; title: string }>> {
-	const { stdout, code } = await pi.exec("git", ["log", `--oneline`, `-n`, `${limit}`]);
-	if (code !== 0) return [];
-
+function parseCommitLog(stdout: string): ReviewCommit[] {
 	return stdout
 		.trim()
 		.split("\n")
 		.filter((line) => line.trim())
 		.map((line) => {
 			const [sha, ...rest] = line.trim().split(" ");
-			return { sha, title: rest.join(" ") };
+			const title = rest.join(" ").trim();
+			return title ? { sha, title } : { sha };
 		});
+}
+
+/**
+ * Get list of recent commits (newest first)
+ */
+async function getRecentCommits(pi: ExtensionAPI, limit: number = 10): Promise<ReviewCommit[]> {
+	const { stdout, code } = await pi.exec("git", ["log", "--format=%H %s", "-n", `${limit}`]);
+	if (code !== 0) return [];
+	return parseCommitLog(stdout);
+}
+
+/**
+ * Get commits newer than `sha` (exclusive, newest first)
+ */
+async function getCommitsAfter(
+	pi: ExtensionAPI,
+	sha: string,
+): Promise<{ commits: ReviewCommit[]; error?: string }> {
+	const { stdout, stderr, code } = await pi.exec("git", ["log", "--format=%H %s", `${sha}..HEAD`]);
+	if (code !== 0) {
+		return { commits: [], error: stderr.trim() || stdout.trim() || `git log failed with exit code ${code}` };
+	}
+	return { commits: parseCommitLog(stdout) };
+}
+
+/**
+ * Resolve explicit commit shas into log order (newest first).
+ * `git log --no-walk` validates the revisions; the real order comes from a
+ * topology-aware walk, because `--no-walk=sorted` only sorts by committer date.
+ */
+async function resolveCommitList(
+	pi: ExtensionAPI,
+	shas: string[],
+): Promise<{ commits: ReviewCommit[]; error?: string }> {
+	// Fetch titles and reject revisions that do not exist.
+	const picked = await pi.exec("git", [
+		"log",
+		"--no-walk=sorted",
+		"--format=%H %s",
+		"--end-of-options",
+		...shas,
+	]);
+	if (picked.code !== 0) {
+		return {
+			commits: [],
+			error: picked.stderr.trim() || picked.stdout.trim() || `git log failed with exit code ${picked.code}`,
+		};
+	}
+
+	const selected = parseCommitLog(picked.stdout);
+	if (selected.length === 0) return { commits: [] };
+	if (selected.length === 1) return { commits: selected };
+
+	// `--no-walk=sorted` orders by committer date only, which breaks for commits
+	// created in the same second (or with skewed dates). Walk from the selected
+	// commits and keep their first appearance, i.e. topology-aware log order.
+	const tips = selected.map((commit) => commit.sha);
+	const walk = await pi.exec("git", ["log", "--topo-order", "--format=%H", "--end-of-options", ...tips]);
+	if (walk.code !== 0) {
+		return {
+			commits: [],
+			error: walk.stderr.trim() || walk.stdout.trim() || `git log failed with exit code ${walk.code}`,
+		};
+	}
+
+	const bySha = new Map(selected.map((commit) => [commit.sha, commit]));
+	const ordered: ReviewCommit[] = [];
+	const seen = new Set<string>();
+	for (const line of walk.stdout.split("\n")) {
+		const sha = line.trim();
+		if (!bySha.has(sha) || seen.has(sha)) continue;
+		seen.add(sha);
+		ordered.push(bySha.get(sha)!);
+	}
+
+	return { commits: ordered };
+}
+
+/**
+ * Format commits (newest first) as a prompt bullet list, oldest first
+ */
+function formatCommitList(commits: ReviewCommit[]): string {
+	const line = (commit: ReviewCommit) =>
+		`- ${commit.sha}${commit.title ? ` ${commit.title}` : ""}`;
+	const oldestFirst = [...commits].reverse();
+	if (oldestFirst.length <= 40) return oldestFirst.map(line).join("\n");
+
+	// Keep the prompt small for long ranges; the review prompt also carries the
+	// exact diff command, so the full list is not needed to inspect the changes.
+	const omitted = oldestFirst.length - 30;
+	const head = oldestFirst.slice(0, 20).map(line);
+	const tail = oldestFirst.slice(-10).map(line);
+	return [...head, `- … (${omitted} commits omitted)`, ...tail].join("\n");
 }
 
 /**
@@ -826,6 +942,45 @@ async function getDefaultBranch(pi: ExtensionAPI): Promise<string> {
 }
 
 /**
+ * Build the review prompt for one or more commits (newest first)
+ */
+async function buildCommitsPrompt(
+	pi: ExtensionAPI,
+	commits: ReviewCommit[],
+	rangeBase?: string,
+): Promise<string> {
+	if (commits.length === 1) {
+		const [commit] = commits;
+		return commit.title
+			? COMMIT_PROMPT_WITH_TITLE.replace("{sha}", commit.sha).replace("{title}", commit.title)
+			: COMMIT_PROMPT.replace("{sha}", commit.sha);
+	}
+
+	const newest = commits[0]!;
+	const replace = (prompt: string, base: string) =>
+		prompt
+			.replace("{count}", String(commits.length))
+			.replace("{commits}", formatCommitList(commits))
+			.replace("{base}", base)
+			.replace("{newest}", newest.sha);
+
+	// An explicit base ("every commit after X") must be used verbatim: the oldest
+	// selected commit's parent can differ from X when history is non-linear.
+	if (rangeBase) return replace(COMMITS_RANGE_PROMPT, rangeBase);
+
+	const oldest = commits[commits.length - 1]!;
+	// `rev-list --count oldest^..newest` equals the selection size only when the
+	// selected commits are exactly that contiguous run, so a single `git diff`
+	// covers the selection without pulling in unrelated commits.
+	const { stdout, code } = await pi.exec("git", ["rev-list", "--count", `${oldest.sha}^..${newest.sha}`]);
+	const contiguous = code === 0 && Number.parseInt(stdout.trim(), 10) === commits.length;
+
+	return contiguous
+		? replace(COMMITS_DIFF_PROMPT, `${oldest.sha}^`)
+		: replace(COMMITS_PROMPT, "");
+}
+
+/**
  * Build the review prompt based on target
  */
 async function buildReviewPrompt(
@@ -844,11 +999,8 @@ async function buildReviewPrompt(
 			return basePrompt;
 		}
 
-		case "commit":
-			if (target.title) {
-				return COMMIT_PROMPT_WITH_TITLE.replace("{sha}", target.sha).replace("{title}", target.title);
-			}
-			return COMMIT_PROMPT.replace("{sha}", target.sha);
+		case "commits":
+			return await buildCommitsPrompt(pi, target.commits, target.rangeBase);
 
 		case "pullRequest": {
 			const mergeBase = await getMergeBase(pi, target.baseBranch);
@@ -879,9 +1031,16 @@ function getUserFacingHint(target: ReviewTarget): string {
 			return "current changes";
 		case "baseBranch":
 			return `changes against '${target.branch}'`;
-		case "commit": {
-			const shortSha = target.sha.slice(0, 7);
-			return target.title ? `commit ${shortSha}: ${target.title}` : `commit ${shortSha}`;
+		case "commits": {
+			if (target.commits.length === 1) {
+				const [commit] = target.commits;
+				const shortSha = commit.sha.slice(0, 7);
+				return commit.title ? `commit ${shortSha}: ${commit.title}` : `commit ${shortSha}`;
+			}
+
+			const newest = target.commits[0]!.sha.slice(0, 7);
+			const oldest = target.commits[target.commits.length - 1]!.sha.slice(0, 7);
+			return `${target.commits.length} commits ${oldest}..${newest}`;
 		}
 
 		case "pullRequest": {
@@ -900,7 +1059,7 @@ function getUserFacingHint(target: ReviewTarget): string {
 const REVIEW_PRESETS = [
 	{ value: "uncommitted", label: "Review uncommitted changes", description: "" },
 	{ value: "baseBranch", label: "Review against a base branch", description: "(local)" },
-	{ value: "commit", label: "Review a commit", description: "" },
+	{ value: "commit", label: "Review commits", description: "(multi-select)" },
 	{ value: "pullRequest", label: "Review a pull request", description: "(GitHub PR)" },
 	{ value: "folder", label: "Review a folder (or more)", description: "(snapshot, not diff)" },
 ] as const;
@@ -1374,26 +1533,23 @@ export default function reviewExtension(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Show commit selector
+	 * Show commit selector (multi-select with range shortcuts)
 	 */
 	async function showCommitSelector(ctx: ExtensionContext): Promise<ReviewTarget | null> {
-		const commits = await getRecentCommits(pi, 20);
+		const commits = await getRecentCommits(pi, 50);
 
 		if (commits.length === 0) {
 			ctx.ui.notify("No commits found", "error");
 			return null;
 		}
 
-		const items: SelectItem[] = commits.map((commit) => ({
-			value: commit.sha,
-			label: `${commit.sha.slice(0, 7)} ${commit.title}`,
-			description: "",
-		}));
+		const selected = new Set<string>();
+		type CommitSelection = { commits: ReviewCommit[]; rangeBase?: string };
 
-		const result = await ctx.ui.custom<{ sha: string; title: string } | null>((tui, theme, keybindings, done) => {
+		const result = await ctx.ui.custom<CommitSelection | null>((tui, theme, keybindings, done) => {
 			const container = new Container();
 			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
-			container.addChild(new Text(theme.fg("accent", theme.bold("Select commit to review"))));
+			container.addChild(new Text(theme.fg("accent", theme.bold("Select commit(s) to review"))));
 
 			const searchInput = new Input();
 			container.addChild(searchInput);
@@ -1401,46 +1557,77 @@ export default function reviewExtension(pi: ExtensionAPI) {
 
 			const listContainer = new Container();
 			container.addChild(listContainer);
-			container.addChild(new Text(theme.fg("dim", "Type to filter • enter to select • esc to cancel")));
+			const hintText = new Text("");
+			container.addChild(hintText);
 			container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
 
-			let filteredItems = items;
+			let filteredCommits = commits;
 			let selectList: SelectList | null = null;
 
-			const updateList = () => {
+			const selectedCommits = () => commits.filter((commit) => selected.has(commit.sha));
+
+			const updateHint = () => {
+				const count = selected.size;
+				const confirmHint =
+					count > 0
+						? `enter reviews ${count} selected commit${count === 1 ? "" : "s"}`
+						: "enter reviews the highlighted commit";
+				hintText.setText(
+					theme.fg("dim", `space toggle • ctrl+r highlighted…newest • ${confirmHint} • esc cancel`),
+				);
+			};
+
+			const buildItems = (): SelectItem[] =>
+				filteredCommits.map((commit) => ({
+					value: commit.sha,
+					label: `${selected.has(commit.sha) ? "◉" : "○"} ${commit.sha.slice(0, 7)} ${commit.title ?? ""}`,
+					description: "",
+				}));
+
+			const currentIndex = () => {
+				const item = selectList?.getSelectedItem();
+				if (!item) return 0;
+				return Math.max(0, filteredCommits.findIndex((commit) => commit.sha === item.value));
+			};
+
+			const updateList = (index: number) => {
 				listContainer.clear();
-				if (filteredItems.length === 0) {
+				if (filteredCommits.length === 0) {
 					listContainer.addChild(new Text(theme.fg("warning", "  No matching commits")));
 					selectList = null;
+					updateHint();
 					return;
 				}
 
-				selectList = new SelectList(filteredItems, Math.min(filteredItems.length, 10), {
+				selectList = new SelectList(buildItems(), Math.min(filteredCommits.length, 10), {
 					selectedPrefix: (text) => theme.fg("accent", text),
 					selectedText: (text) => theme.fg("accent", text),
 					description: (text) => theme.fg("muted", text),
 					scrollInfo: (text) => theme.fg("dim", text),
 					noMatch: (text) => theme.fg("warning", text),
 				});
+				selectList.setSelectedIndex(index);
 
 				selectList.onSelect = (item) => {
 					const commit = commits.find((c) => c.sha === item.value);
-					if (commit) {
-						done(commit);
-					} else {
+					if (!commit) {
 						done(null);
+						return;
 					}
+					// Enter with a selection reviews the selection; otherwise the highlighted commit.
+					done({ commits: selected.size > 0 ? selectedCommits() : [commit] });
 				};
 				selectList.onCancel = () => done(null);
 				listContainer.addChild(selectList);
+				updateHint();
 			};
 
 			const applyFilter = () => {
 				const query = searchInput.getValue();
-				filteredItems = query
-					? fuzzyFilter(items, query, (item) => `${item.label} ${item.value} ${item.description ?? ""}`)
-					: items;
-				updateList();
+				filteredCommits = query
+					? fuzzyFilter(commits, query, (commit) => `${commit.sha} ${commit.title ?? ""}`)
+					: commits;
+				updateList(0);
 			};
 
 			applyFilter();
@@ -1453,6 +1640,37 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					container.invalidate();
 				},
 				handleInput(data: string) {
+					if (matchesKey(data, Key.space)) {
+						const item = selectList?.getSelectedItem();
+						if (item) {
+							const index = currentIndex();
+							if (selected.has(item.value)) {
+								selected.delete(item.value);
+							} else {
+								selected.add(item.value);
+							}
+							updateList(index);
+							tui.requestRender();
+						}
+						return;
+					}
+
+					// "Review commits after this one": the highlighted commit is the
+					// exclusive base, so everything newer in the log is included.
+					if (matchesKey(data, Key.ctrl("r"))) {
+						const item = selectList?.getSelectedItem();
+						if (item) {
+							const index = commits.findIndex((commit) => commit.sha === item.value);
+							const newer = index > 0 ? commits.slice(0, index) : [];
+							if (newer.length === 0) {
+								ctx.ui.notify("No commits newer than the highlighted commit", "info");
+							} else {
+								done({ commits: newer, rangeBase: item.value });
+							}
+						}
+						return;
+					}
+
 					if (
 						keybindings.matches(data, "tui.select.up") ||
 						keybindings.matches(data, "tui.select.down") ||
@@ -1476,7 +1694,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		});
 
 		if (!result) return null;
-		return { type: "commit", sha: result.sha, title: result.title };
+		return { type: "commits", commits: result.commits, rangeBase: result.rangeBase };
 	}
 
 
@@ -2388,7 +2606,12 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 	};
 
 	type ParsedReviewArgs = {
-		target: ReviewTarget | { type: "pr"; ref: string } | null;
+		target:
+			| ReviewTarget
+			| { type: "pr"; ref: string }
+			| { type: "commitsAfter"; sha: string }
+			| { type: "commitsList"; shas: string[] }
+			| null;
 		extraInstruction?: string;
 		auto?: ParsedAutoFlags;
 		error?: string;
@@ -2544,7 +2767,19 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 				const sha = parts[1];
 				if (!sha) return parsed(null);
 				const title = parts.slice(2).join(" ") || undefined;
-				return parsed({ type: "commit", sha, title });
+				return parsed({ type: "commits", commits: [{ sha, title }] });
+			}
+
+			case "commits": {
+				const shas = parts.slice(1);
+				if (shas.length === 0) return parsed(null);
+				return parsed({ type: "commitsList", shas });
+			}
+
+			case "after": {
+				const sha = parts[1];
+				if (!sha) return parsed(null);
+				return parsed({ type: "commitsAfter", sha });
 			}
 
 			case "folder": {
@@ -2573,7 +2808,7 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 
 	// Register the /review command
 	pi.registerCommand("review", {
-		description: "Review code changes (PR, uncommitted, branch, commit, or folder)",
+		description: "Review code changes (PR, uncommitted, branch, commits, or folder)",
 		handler: async (args, ctx) => {
 			if (!ctx.hasUI) {
 				ctx.ui.notify("Review requires interactive mode", "error");
@@ -2616,6 +2851,32 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 					if (!target) {
 						ctx.ui.notify("PR review failed. Returning to review menu.", "warning");
 					}
+				} else if (parsed.target.type === "commitsAfter") {
+					// Resolve the range now so an empty range fails before a review starts.
+					const { commits, error } = await getCommitsAfter(pi, parsed.target.sha);
+					if (error) {
+						ctx.ui.notify(`Failed to list commits after ${parsed.target.sha}: ${error}`, "error");
+						return;
+					}
+					if (commits.length === 0) {
+						ctx.ui.notify(
+							`No commits found after ${parsed.target.sha}. Make sure the commit exists and is not HEAD.`,
+							"error",
+						);
+						return;
+					}
+					target = { type: "commits", commits, rangeBase: parsed.target.sha };
+				} else if (parsed.target.type === "commitsList") {
+					const { commits, error } = await resolveCommitList(pi, parsed.target.shas);
+					if (error) {
+						ctx.ui.notify(`Failed to resolve commits: ${error}`, "error");
+						return;
+					}
+					if (commits.length === 0) {
+						ctx.ui.notify(`No commits found for: ${parsed.target.shas.join(" ")}`, "error");
+						return;
+					}
+					target = { type: "commits", commits };
 				} else {
 					target = parsed.target;
 				}
