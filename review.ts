@@ -753,7 +753,7 @@ async function getCommitsAfter(
 	pi: ExtensionAPI,
 	sha: string,
 ): Promise<{ commits: ReviewCommit[]; error?: string }> {
-	const { stdout, stderr, code } = await pi.exec("git", ["log", "--format=%H %s", `${sha}..HEAD`]);
+	const { stdout, stderr, code } = await pi.exec("git", ["log", "--format=%H %s", "--end-of-options", `${sha}..HEAD`]);
 	if (code !== 0) {
 		return { commits: [], error: stderr.trim() || stdout.trim() || `git log failed with exit code ${code}` };
 	}
@@ -814,16 +814,16 @@ async function resolveCommitList(
 }
 
 /**
- * Format commits (newest first) as a prompt bullet list, oldest first
+ * Format commits (newest first) as a prompt bullet list, oldest first.
+ * `truncate` keeps the prompt small for long ranges, which is only safe when the
+ * prompt also carries the exact diff command; the per-commit path needs every sha.
  */
-function formatCommitList(commits: ReviewCommit[]): string {
+function formatCommitList(commits: ReviewCommit[], truncate: boolean): string {
 	const line = (commit: ReviewCommit) =>
 		`- ${commit.sha}${commit.title ? ` ${commit.title}` : ""}`;
 	const oldestFirst = [...commits].reverse();
-	if (oldestFirst.length <= 40) return oldestFirst.map(line).join("\n");
+	if (!truncate || oldestFirst.length <= 40) return oldestFirst.map(line).join("\n");
 
-	// Keep the prompt small for long ranges; the review prompt also carries the
-	// exact diff command, so the full list is not needed to inspect the changes.
 	const omitted = oldestFirst.length - 30;
 	const head = oldestFirst.slice(0, 20).map(line);
 	const tail = oldestFirst.slice(-10).map(line);
@@ -957,27 +957,35 @@ async function buildCommitsPrompt(
 	}
 
 	const newest = commits[0]!;
-	const replace = (prompt: string, base: string) =>
-		prompt
-			.replace("{count}", String(commits.length))
-			.replace("{commits}", formatCommitList(commits))
-			.replace("{base}", base)
-			.replace("{newest}", newest.sha);
+	const oldest = commits[commits.length - 1]!;
+
+	// A single `git diff oldest^...newest` covers the selection only when the
+	// selected commits are exactly that range. Comparing counts is not enough:
+	// commits outside `oldest^..newest` can make the counts coincide, which would
+	// silently review unselected commits and drop selected ones.
+	const { stdout, code } = await pi.exec("git", ["rev-list", `${oldest.sha}^..${newest.sha}`]);
+	const inRange = new Set(
+		stdout
+			.split("\n")
+			.map((sha) => sha.trim())
+			.filter(Boolean),
+	);
+	const contiguous =
+		code === 0 && inRange.size === commits.length && commits.every((commit) => inRange.has(commit.sha));
 
 	// An explicit base ("every commit after X") must be used verbatim: the oldest
 	// selected commit's parent can differ from X when history is non-linear.
-	if (rangeBase) return replace(COMMITS_RANGE_PROMPT, rangeBase);
+	const prompt = rangeBase ? COMMITS_RANGE_PROMPT : contiguous ? COMMITS_DIFF_PROMPT : COMMITS_PROMPT;
 
-	const oldest = commits[commits.length - 1]!;
-	// `rev-list --count oldest^..newest` equals the selection size only when the
-	// selected commits are exactly that contiguous run, so a single `git diff`
-	// covers the selection without pulling in unrelated commits.
-	const { stdout, code } = await pi.exec("git", ["rev-list", "--count", `${oldest.sha}^..${newest.sha}`]);
-	const contiguous = code === 0 && Number.parseInt(stdout.trim(), 10) === commits.length;
+	// Truncating is only safe when the prompt carries one exact diff command for
+	// the whole selection; the per-commit prompt needs every sha.
+	const truncate = Boolean(rangeBase) || contiguous;
 
-	return contiguous
-		? replace(COMMITS_DIFF_PROMPT, `${oldest.sha}^`)
-		: replace(COMMITS_PROMPT, "");
+	return prompt
+		.replace("{count}", String(commits.length))
+		.replace("{commits}", formatCommitList(commits, truncate))
+		.replace("{base}", rangeBase ?? `${oldest.sha}^`)
+		.replace("{newest}", newest.sha);
 }
 
 /**
@@ -1694,7 +1702,21 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		});
 
 		if (!result) return null;
-		return { type: "commits", commits: result.commits, rangeBase: result.rangeBase };
+		// `getRecentCommits` returns plain git log order, so the newest/oldest
+		// boundaries used by the prompt and hint are re-resolved topology-aware.
+		const { commits: ordered, error } = await resolveCommitList(
+			pi,
+			result.commits.map((commit) => commit.sha),
+		);
+		if (error) {
+			ctx.ui.notify(`Failed to resolve commits: ${error}`, "error");
+			return null;
+		}
+		if (ordered.length === 0) {
+			ctx.ui.notify("No commits found for the selection", "error");
+			return null;
+		}
+		return { type: "commits", commits: ordered, rangeBase: result.rangeBase };
 	}
 
 
@@ -2766,8 +2788,11 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 			case "commit": {
 				const sha = parts[1];
 				if (!sha) return parsed(null);
-				const title = parts.slice(2).join(" ") || undefined;
-				return parsed({ type: "commits", commits: [{ sha, title }] });
+				// The title is read from `git log`, so trailing words are not a title any more.
+				if (parts.length > 2) {
+					return { target: null, error: `Unexpected arguments after ${sha}` };
+				}
+				return parsed({ type: "commitsList", shas: [sha] });
 			}
 
 			case "commits": {
