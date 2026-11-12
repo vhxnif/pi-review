@@ -516,7 +516,7 @@ const COMMITS_RANGE_PROMPT =
 	"Review the code changes introduced by the following {count} commits, i.e. every commit after {base} up to {newest} (oldest first):\n{commits}\n\n`git diff {base}...{newest}` shows exactly their combined changes. Run that command to inspect the diff. Provide prioritized, actionable findings.";
 
 const COMMITS_PROMPT =
-	"Review the code changes introduced by the following {count} commits (oldest first):\n{commits}\n\nInspect each commit individually with `git diff <sha>^ <sha>` (for a merge commit this shows the changes merged in) and review the changes across all of them together. Provide prioritized, actionable findings.";
+	"Review the code changes introduced by the following {count} commits (oldest first):\n{commits}\n\nInspect each commit individually with `git diff <sha>^ <sha>` (for a merge commit this shows the changes merged in; a root commit has no parent, so use `git show <sha>` for it) and review the changes across all of them together. Provide prioritized, actionable findings.";
 
 const PULL_REQUEST_PROMPT =
 	'Review pull request #{prNumber} ("{title}") against the base branch \'{baseBranch}\'. The merge base commit for this comparison is {mergeBaseSha}. Run `git diff {mergeBaseSha}` to inspect the changes that would be merged. Provide prioritized, actionable findings.';
@@ -952,29 +952,53 @@ async function buildCommitsPrompt(
 	if (commits.length === 1) {
 		const [commit] = commits;
 		return commit.title
-			? COMMIT_PROMPT_WITH_TITLE.replace("{sha}", commit.sha).replace("{title}", commit.title)
+			? COMMIT_PROMPT_WITH_TITLE.replace("{sha}", commit.sha).replace("{title}", () => commit.title!)
 			: COMMIT_PROMPT.replace("{sha}", commit.sha);
 	}
 
 	const newest = commits[0]!;
 	const oldest = commits[commits.length - 1]!;
 
-	// A single `git diff oldest^...newest` covers the selection only when the
-	// selected commits are exactly that range. Comparing counts is not enough:
-	// commits outside `oldest^..newest` can make the counts coincide, which would
-	// silently review unselected commits and drop selected ones.
-	const { stdout, code } = await pi.exec("git", ["rev-list", `${oldest.sha}^..${newest.sha}`]);
-	const inRange = new Set(
-		stdout
-			.split("\n")
-			.map((sha) => sha.trim())
-			.filter(Boolean),
-	);
-	const contiguous =
-		code === 0 && inRange.size === commits.length && commits.every((commit) => inRange.has(commit.sha));
-
 	// An explicit base ("every commit after X") must be used verbatim: the oldest
 	// selected commit's parent can differ from X when history is non-linear.
+	let contiguous = false;
+	if (!rangeBase) {
+		// The oldest commit's parent is the range base, and a root commit has none.
+		const parentCheck = await pi.exec("git", [
+			"rev-list",
+			"--parents",
+			"--max-count=1",
+			"--end-of-options",
+			oldest.sha,
+		]);
+		if (parentCheck.code !== 0) {
+			throw new Error(
+				`Failed to inspect commit ${oldest.sha}: ${parentCheck.stderr.trim() || `git rev-list exited with code ${parentCheck.code}`}`,
+			);
+		}
+		const isRoot = parentCheck.stdout.trim().split(/\s+/).filter(Boolean).length <= 1;
+
+		if (!isRoot) {
+			// A single `git diff oldest^...newest` covers the selection only when the
+			// selected commits are exactly that range. Comparing counts is not enough:
+			// commits outside `oldest^..newest` can make the counts coincide, which would
+			// silently review unselected commits and drop selected ones.
+			const { stdout, stderr, code } = await pi.exec("git", ["rev-list", `${oldest.sha}^..${newest.sha}`]);
+			if (code !== 0) {
+				throw new Error(
+					`Failed to list commits in ${oldest.sha}^..${newest.sha}: ${stderr.trim() || `git rev-list exited with code ${code}`}`,
+				);
+			}
+			const inRange = new Set(
+				stdout
+					.split("\n")
+					.map((sha) => sha.trim())
+					.filter(Boolean),
+			);
+			contiguous = inRange.size === commits.length && commits.every((commit) => inRange.has(commit.sha));
+		}
+	}
+
 	const prompt = rangeBase ? COMMITS_RANGE_PROMPT : contiguous ? COMMITS_DIFF_PROMPT : COMMITS_PROMPT;
 
 	// Truncating is only safe when the prompt carries one exact diff command for
@@ -983,7 +1007,8 @@ async function buildCommitsPrompt(
 
 	return prompt
 		.replace("{count}", String(commits.length))
-		.replace("{commits}", formatCommitList(commits, truncate))
+		// Function replacement so `$` sequences in commit titles stay literal.
+		.replace("{commits}", () => formatCommitList(commits, truncate))
 		.replace("{base}", rangeBase ?? `${oldest.sha}^`)
 		.replace("{newest}", newest.sha);
 }
@@ -1664,17 +1689,12 @@ export default function reviewExtension(pi: ExtensionAPI) {
 					}
 
 					// "Review commits after this one": the highlighted commit is the
-					// exclusive base, so everything newer in the log is included.
+					// exclusive base, so everything newer in the log is included. The range
+					// itself is resolved by git below, not by slicing the date-ordered list.
 					if (matchesKey(data, Key.ctrl("r"))) {
 						const item = selectList?.getSelectedItem();
 						if (item) {
-							const index = commits.findIndex((commit) => commit.sha === item.value);
-							const newer = index > 0 ? commits.slice(0, index) : [];
-							if (newer.length === 0) {
-								ctx.ui.notify("No commits newer than the highlighted commit", "info");
-							} else {
-								done({ commits: newer, rangeBase: item.value });
-							}
+							done({ commits: [], rangeBase: item.value });
 						}
 						return;
 					}
@@ -1702,6 +1722,23 @@ export default function reviewExtension(pi: ExtensionAPI) {
 		});
 
 		if (!result) return null;
+
+		// `ctrl+r` means "every commit after <base>", so let git walk the range
+		// instead of slicing the recent-commit list (date order, not topology, and
+		// capped at 50 commits).
+		if (result.rangeBase) {
+			const { commits: newer, error } = await getCommitsAfter(pi, result.rangeBase);
+			if (error) {
+				ctx.ui.notify(`Failed to list commits after ${result.rangeBase}: ${error}`, "error");
+				return null;
+			}
+			if (newer.length === 0) {
+				ctx.ui.notify(`No commits newer than ${result.rangeBase}`, "info");
+				return null;
+			}
+			return { type: "commits", commits: newer, rangeBase: result.rangeBase };
+		}
+
 		// `getRecentCommits` returns plain git log order, so the newest/oldest
 		// boundaries used by the prompt and hint are re-resolved topology-aware.
 		const { commits: ordered, error } = await resolveCommitList(
@@ -1716,7 +1753,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			ctx.ui.notify("No commits found for the selection", "error");
 			return null;
 		}
-		return { type: "commits", commits: ordered, rangeBase: result.rangeBase };
+		return { type: "commits", commits: ordered };
 	}
 
 
@@ -2804,6 +2841,9 @@ Keep it concise and factual; the reviewer will verify against the actual files.`
 			case "after": {
 				const sha = parts[1];
 				if (!sha) return parsed(null);
+				if (parts.length > 2) {
+					return { target: null, error: `Unexpected arguments after ${sha}` };
+				}
 				return parsed({ type: "commitsAfter", sha });
 			}
 
