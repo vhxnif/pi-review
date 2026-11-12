@@ -13,7 +13,8 @@ pi install git:github.com/vhxnif/pi-review
 
 - Review **uncommitted changes**
 - Review changes against a **base branch**
-- Review a specific **commit**
+- Review one or more **commits** (multi-select in the picker)
+- Review **every commit after** a given commit
 - Review a GitHub **pull request** (checks it out locally via `gh`)
 - Review one or more **folders/files** as a snapshot (not a diff)
 - Produce prioritized findings with a clear verdict and actionable follow-ups
@@ -29,6 +30,8 @@ It also supports custom shared instructions that are loaded from `REVIEW_GUIDELI
 /review uncommitted
 /review branch main
 /review commit abc123
+/review commits abc123 def456
+/review after abc123
 /review pr 123
 /review pr https://github.com/owner/repo/pull/123
 /review folder src docs
@@ -42,6 +45,26 @@ When a review session is active, finish it with:
 ```
 
 You can then return only, return + summarize, or return + queue fixing work.
+
+## Reviewing commits
+
+`Review commits` in the picker lists the recent commits with multi-select:
+
+- `space` toggles the highlighted commit in the selection
+- `ctrl+r` reviews every commit newer than the highlighted one (exclusive)
+- `enter` reviews the selection, or the highlighted commit when nothing is selected
+- typing filters the list (space toggles instead of typing); `esc` cancels
+
+A contiguous selection is reviewed as a single `git diff <base>...<newest>`; a
+non-contiguous selection is reviewed commit by commit (`git diff <sha>^ <sha>`).
+For `ctrl+r` and `/review after <sha>` the base is the highlighted/explicit
+commit; for a contiguous multi-select it is the oldest selected commit's parent.
+The same targets are available from the command line:
+
+```bash
+/review commits abc123 def456
+/review after abc123
+```
 
 ## Review model
 
